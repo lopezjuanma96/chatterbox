@@ -1,6 +1,7 @@
 # Copyright (c) 2025 Resemble AI
 # Author: John Meade, Jeremy Hsu
 # MIT License
+import copy
 import logging
 import torch
 from dataclasses import dataclass
@@ -42,7 +43,8 @@ class AlignmentStreamAnalyzer:
         # self.queue = queue
         self.text_tokens_slice = (i, j) = text_tokens_slice
         self.eos_idx = eos_idx
-        self.alignment = torch.zeros(0, j-i)
+        self.device = next(tfmr.parameters()).device
+        self.alignment = torch.zeros(0, j-i, device=self.device)
         # self.alignment_bin = torch.zeros(0, j-i)
         self.curr_frame_pos = 0
         self.text_position = 0
@@ -56,38 +58,47 @@ class AlignmentStreamAnalyzer:
         # Track generated tokens for repetition detection
         self.generated_tokens = []
 
-        # Using `output_attentions=True` is incompatible with optimized attention kernels, so
-        # using it for all layers slows things down too much. We can apply it to just one layer
-        # by intercepting the kwargs and adding a forward hook (credit: jrm)
+        # Using `output_attentions=True` globally is incompatible with optimized attention
+        # kernels (SDPA/FlashAttention) — it forces ALL layers to eager math. Instead, we
+        # inject output_attentions=True only on the 3 layers we need (9, 12, 13) via per-layer
+        # pre-hooks, keeping the other 27 layers on fast SDPA.
         self.last_aligned_attns = []
+
         for i, (layer_idx, head_idx) in enumerate(LLAMA_ALIGNED_HEADS):
             self.last_aligned_attns += [None]
             self._add_attention_spy(tfmr, i, layer_idx, head_idx)
 
     def _add_attention_spy(self, tfmr, buffer_idx, layer_idx, head_idx):
         """
-        Adds a forward hook to a specific attention layer to collect outputs.
+        Adds a forward hook to a specific attention layer to collect attention weights,
+        and a pre-hook to force output_attentions=True only for this layer (keeping
+        the other layers on fast SDPA).
         """
         def attention_forward_hook(module, input, output):
             """
             See `LlamaAttention.forward`; the output is a 3-tuple: `attn_output, attn_weights, past_key_value`.
-            NOTE:
-            - When `output_attentions=True`, `LlamaSdpaAttention.forward` calls `LlamaAttention.forward`.
-            - `attn_output` has shape [B, H, T0, T0] for the 0th entry, and [B, H, 1, T0+i] for the rest i-th.
+            When `output_attentions=True`, the layer falls back to eager math and returns weights.
+            `attn_output` has shape [B, H, T0, T0] for the 0th entry, and [B, H, 1, T0+i] for the rest i-th.
             """
             if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
-                step_attention = output[1].cpu()  # (B, n_heads, T0, Ti)
+                step_attention = output[1]  # (B, n_heads, T0, Ti) — keep on GPU
                 self.last_aligned_attns[buffer_idx] = step_attention[0, head_idx]  # (T0, Ti)
 
+        def force_output_attentions(module, args, kwargs):
+            """Pre-hook: inject output_attentions=True into this layer's forward kwargs."""
+            kwargs['output_attentions'] = True
+            return args, kwargs
+
         target_layer = tfmr.layers[layer_idx].self_attn
-        # Register hook and store the handle
+
+        # Give this layer its own config copy with eager attention so it can
+        # return attention weights. All other layers keep the shared config (SDPA).
+        eager_config = copy.copy(tfmr.config)
+        eager_config._attn_implementation = 'eager'
+        target_layer.config = eager_config
+
+        target_layer.register_forward_pre_hook(force_output_attentions, with_kwargs=True)
         target_layer.register_forward_hook(attention_forward_hook)
-        if hasattr(tfmr, 'config') and hasattr(tfmr.config, 'output_attentions'):
-            self.original_output_attentions = tfmr.config.output_attentions
-            self.original_attn_implementation = getattr(tfmr.config, '_attn_implementation', None)
-            if getattr(tfmr.config, '_attn_implementation', None) == 'sdpa':
-                tfmr.config._attn_implementation = 'eager'
-            tfmr.config.output_attentions = True
 
     def step(self, logits, next_token=None):
         """
@@ -98,10 +109,10 @@ class AlignmentStreamAnalyzer:
         i, j = self.text_tokens_slice
         if self.curr_frame_pos == 0:
             # first chunk has conditioning info, text tokens, and BOS token
-            A_chunk = aligned_attn[j:, i:j].clone().cpu() # (T, S)
+            A_chunk = aligned_attn[j:, i:j].clone() # (T, S) — stays on GPU
         else:
             # subsequent chunks have 1 frame due to KV-caching
-            A_chunk = aligned_attn[:, i:j].clone().cpu() # (1, S)
+            A_chunk = aligned_attn[:, i:j].clone() # (1, S) — stays on GPU
 
         # TODO: monotonic masking; could have issue b/c spaces are often skipped.
         A_chunk[:, self.curr_frame_pos + 1:] = 0

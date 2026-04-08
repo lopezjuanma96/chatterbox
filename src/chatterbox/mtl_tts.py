@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 import os
@@ -19,6 +20,8 @@ from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
 
+
+logger = logging.getLogger(__name__)
 
 REPO_ID = "ResembleAI/chatterbox"
 
@@ -197,12 +200,18 @@ class ChatterboxMultilingualTTS:
             t3_state = t3_state["model"][0]
         t3.load_state_dict(t3_state)
         t3.to(device=device, dtype=dtype).eval()
+        # NOTE: torch.compile on T3 disabled — incompatible with this transformers
+        # version (output_capturing.py loses torch reference). See PENDING.md.
+        # t3.compile_for_inference(mode="default")
 
         s3gen = S3Gen()
         s3gen.load_state_dict(
             torch.load(ckpt_dir / "s3gen.pt", map_location=map_location, weights_only=True)
         )
         s3gen.to(device=device, dtype=dtype).eval()
+        # NOTE: torch.compile on S3Gen disabled — too many graph breaks (.item() in
+        # mask.py, dynamic shapes) cause recompilation overhead. See PENDING.md.
+        # s3gen.compile_for_inference()
 
         tokenizer = MTLTokenizer(
             str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json")
@@ -394,8 +403,13 @@ class ChatterboxMultilingualTTS:
         bos_embed = torch.cat([bos_embed, bos_embed])  # batch=2 for CFG
 
         inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
-        generated_ids = bos_token.clone()
         chunk_buffer = []
+        stop_token = self.t3.hp.stop_speech_token
+
+        # Pre-allocate token buffer to avoid O(N²) torch.cat growth
+        generated_ids = torch.zeros(1, max_new_tokens + 1, dtype=torch.long, device=device)
+        generated_ids[0, 0] = self.t3.hp.start_speech_token
+        gen_pos = 1  # next write position
 
         top_p_warper = TopPLogitsWarper(top_p=top_p)
         min_p_warper = MinPLogitsWarper(min_p=min_p)
@@ -405,8 +419,7 @@ class ChatterboxMultilingualTTS:
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
-            output_attentions=True,
-            output_hidden_states=True,
+            output_attentions=False,
             return_dict=True,
         )
         past = output.past_key_values
@@ -420,10 +433,10 @@ class ChatterboxMultilingualTTS:
             logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
 
             # Alignment stream analyzer: suppresses hallucinations / forces EOS when needed
-            last_token = generated_ids[0, -1].item() if generated_ids.size(1) > 0 else None
+            last_token = generated_ids[0, gen_pos - 1].item() if gen_pos > 0 else None
             logits = alignment_stream_analyzer.step(logits, next_token=last_token)
 
-            ids_for_proc = generated_ids[:1, ...]
+            ids_for_proc = generated_ids[:1, :gen_pos]
             logits = rep_pen(ids_for_proc, logits)
             if temperature == 0.0:
                 next_token = logits.argmax(dim=-1, keepdim=True)
@@ -436,15 +449,19 @@ class ChatterboxMultilingualTTS:
                 next_token = torch.multinomial(probs, num_samples=1)
 
             chunk_buffer.append(next_token)
-            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            generated_ids[0, gen_pos] = next_token.view(-1)
+            gen_pos += 1
 
-            if next_token.view(-1) == self.t3.hp.stop_speech_token:
-                if chunk_buffer:
-                    yield torch.cat(chunk_buffer, dim=1)
-                break
-
+            # Defer EOS check to chunk boundaries (one sync per chunk instead of per token)
             if len(chunk_buffer) >= chunk_size:
-                yield torch.cat(chunk_buffer, dim=1)
+                chunk_tokens = torch.cat(chunk_buffer, dim=1)
+                eos_mask = (chunk_tokens.view(-1) == stop_token)
+                if eos_mask.any().item():
+                    eos_idx = eos_mask.nonzero(as_tuple=False)[0].item()
+                    if eos_idx > 0:
+                        yield chunk_tokens[:, :eos_idx]
+                    break
+                yield chunk_tokens
                 chunk_buffer = []
 
             next_token_embed = self.t3.speech_emb(next_token)
@@ -454,11 +471,21 @@ class ChatterboxMultilingualTTS:
             output = patched_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
-                output_attentions=True,
-                output_hidden_states=True,
+                output_attentions=False,
                 return_dict=True,
             )
             past = output.past_key_values
+
+        # Flush remaining buffer (max_new_tokens reached or final partial chunk)
+        if chunk_buffer:
+            chunk_tokens = torch.cat(chunk_buffer, dim=1)
+            eos_mask = (chunk_tokens.view(-1) == stop_token)
+            if eos_mask.any().item():
+                eos_idx = eos_mask.nonzero(as_tuple=False)[0].item()
+                if eos_idx > 0:
+                    yield chunk_tokens[:, :eos_idx]
+            else:
+                yield chunk_tokens
 
     def _process_token_chunk(
         self,
@@ -468,6 +495,7 @@ class ChatterboxMultilingualTTS:
         start_time: float,
         metrics: StreamingMetrics,
         fade_duration: float = 0.02,
+        cfm_steps: int = 10,
     ) -> Tuple[Optional[torch.Tensor], float]:
         """
         Decode a speech token chunk to audio via S3Gen with context overlap for smooth boundaries.
@@ -487,7 +515,7 @@ class ChatterboxMultilingualTTS:
         if clean.numel() == 0:
             return None, 0.0
 
-        wav, _ = self.s3gen.inference(speech_tokens=clean, ref_dict=self.conds.gen)
+        wav, _ = self.s3gen.inference(speech_tokens=clean, ref_dict=self.conds.gen, n_cfm_timesteps=cfm_steps)
         wav = wav.squeeze(0).detach().cpu().numpy()
 
         if context_length > 0:
@@ -528,10 +556,12 @@ class ChatterboxMultilingualTTS:
         chunk_size: int = 25,
         context_window: int = 50,
         fade_duration: float = 0.02,
+        cfm_steps: int = 10,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming multilingual TTS: yields (audio_chunk, metrics) as tokens are generated.
         chunk_size=25 ≈ 1 second of audio per chunk (S3 token rate is 25 tokens/sec).
+        cfm_steps: number of CFM flow-matching steps (default 10, lower = faster).
         """
         import time
 
@@ -569,8 +599,36 @@ class ChatterboxMultilingualTTS:
 
         total_audio = 0.0
         all_tokens = None
+        t3_time_total = 0.0
+        s3_time_total = 0.0
 
-        with torch.inference_mode():
+        # Pipeline: run S3Gen vocoder on a background thread + separate CUDA stream
+        # so it overlaps with T3 generating the next token chunk.
+        from concurrent.futures import ThreadPoolExecutor
+        is_cuda = (self.device.type == 'cuda') if isinstance(self.device, torch.device) else ('cuda' in str(self.device))
+        s3_stream = torch.cuda.Stream(device=self.device) if is_cuda else None
+
+        def _decode_chunk(token_chunk, all_tokens_snapshot):
+            """Run S3Gen decode on a separate CUDA stream."""
+            s3_start = time.time()
+            if s3_stream is not None:
+                with torch.cuda.stream(s3_stream):
+                    result = self._process_token_chunk(
+                        token_chunk, all_tokens_snapshot, context_window,
+                        start_time, metrics, fade_duration, cfm_steps=cfm_steps,
+                    )
+                s3_stream.synchronize()
+            else:
+                result = self._process_token_chunk(
+                    token_chunk, all_tokens_snapshot, context_window,
+                    start_time, metrics, fade_duration, cfm_steps=cfm_steps,
+                )
+            return (*result, time.time() - s3_start)
+
+        with torch.inference_mode(), ThreadPoolExecutor(max_workers=1) as pool:
+            pending_future = None
+            t3_start = time.time()
+
             for token_chunk in self._inference_stream(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
@@ -583,17 +641,34 @@ class ChatterboxMultilingualTTS:
                 top_p=top_p,
                 chunk_size=chunk_size,
             ):
+                torch.cuda.synchronize()
+                t3_time_total += time.time() - t3_start
+
                 token_chunk = token_chunk[0]  # extract conditional batch
 
-                audio, duration = self._process_token_chunk(
-                    token_chunk, all_tokens, context_window, start_time, metrics, fade_duration
-                )
+                # Collect previous S3Gen result (blocks until background decode finishes)
+                if pending_future is not None:
+                    audio, duration, s3_elapsed = pending_future.result()
+                    s3_time_total += s3_elapsed
+                    if audio is not None:
+                        total_audio += duration
+                        yield audio, metrics
 
+                # Submit current chunk for S3Gen decode in background
+                pending_future = pool.submit(_decode_chunk, token_chunk, all_tokens)
+
+                all_tokens = token_chunk if all_tokens is None else torch.cat([all_tokens, token_chunk], dim=-1)
+                t3_start = time.time()
+
+            # Collect final S3Gen result
+            if pending_future is not None:
+                audio, duration, s3_elapsed = pending_future.result()
+                s3_time_total += s3_elapsed
                 if audio is not None:
                     total_audio += duration
                     yield audio, metrics
 
-                all_tokens = token_chunk if all_tokens is None else torch.cat([all_tokens, token_chunk], dim=-1)
+        print(f"[PERF] T3 token gen: {t3_time_total:.3f}s | S3Gen vocoder: {s3_time_total:.3f}s (overlapped) | wall: {time.time()-start_time:.3f}s", flush=True)
 
         metrics.total_generation_time = time.time() - start_time
         metrics.total_audio_duration = total_audio
